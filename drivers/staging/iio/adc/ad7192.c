@@ -7,6 +7,7 @@
  */
 
 #include <linux/interrupt.h>
+#include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -156,8 +157,9 @@
 struct ad7192_state {
 	struct regulator		*avdd;
 	struct regulator		*dvdd;
+	struct clk			*mclk;
 	u16				int_vref_mv;
-	u32				mclk;
+	u32				fclk;
 	u32				f_order;
 	u32				mode;
 	u32				conf;
@@ -230,8 +232,9 @@ static int ad7192_setup(struct ad7192_state *st,
 			const struct ad7192_platform_data *pdata)
 {
 	struct iio_dev *indio_dev = spi_get_drvdata(st->sd.spi);
+	bool clock_out_en, clock_xtal;
 	unsigned long long scale_uv;
-	int i, ret, id;
+	int i, ret, id, clock_sel;
 
 	/* reset the serial interface */
 	ret = ad_sd_reset(&st->sd, 48);
@@ -250,28 +253,37 @@ static int ad7192_setup(struct ad7192_state *st,
 		dev_warn(&st->sd.spi->dev, "device ID query failed (0x%X)\n",
 			 id);
 
-	switch (pdata->clock_source_sel) {
-	case AD7192_CLK_INT:
-	case AD7192_CLK_INT_CO:
-		st->mclk = AD7192_INT_FREQ_MHZ;
-		break;
-	case AD7192_CLK_EXT_MCLK1_2:
-	case AD7192_CLK_EXT_MCLK2:
-		if (ad7192_valid_external_frequency(pdata->ext_clk_hz)) {
-			st->mclk = pdata->ext_clk_hz;
-			break;
-		}
-		dev_err(&st->sd.spi->dev, "Invalid frequency setting %u\n",
-			pdata->ext_clk_hz);
-		ret = -EINVAL;
-		goto out;
-	default:
-		ret = -EINVAL;
-		goto out;
+	clock_sel = AD7192_CLK_INT;
+	st->fclk = AD7192_INT_FREQ_MHZ;
+
+	st->mclk = devm_clk_get(&st->sd.spi->dev, "clk");
+	if (IS_ERR(st->mclk)) {
+		if (PTR_ERR(st->mclk) != -ENOENT)
+			return PTR_ERR(st->mclk);
+
+		/* use internal clock */
+		clock_out_en = of_property_read_bool(np,
+						     "adi,int-clock-output-enable");
+		if (clock_out_en)
+			clock_sel = AD7192_CLK_INT_CO;
+	} else {
+		clock_xtal = of_property_read_bool(np, "adi,clock-xtal");
+		if (clock_xtal)
+			clock_sel = AD7192_CLK_EXT_MCLK1_2;
+		else
+			clock_sel = AD7192_CLK_EXT_MCLK2;
+
+		ret = clk_prepare_enable(st->mclk);
+		if (ret < 0)
+			return ret;
+
+		st->fclk = clk_get_rate(st->mclk);
+		if (!ad7192_valid_external_frequency(st->fclk))
+			return -EINVAL;
 	}
 
 	st->mode = AD7192_MODE_SEL(AD7192_MODE_IDLE) |
-		AD7192_MODE_CLKSRC(pdata->clock_source_sel) |
+		AD7192_MODE_CLKSRC(clock_sel) |
 		AD7192_MODE_RATE(480);
 
 	st->conf = AD7192_CONF_GAIN(0);
@@ -287,7 +299,7 @@ static int ad7192_setup(struct ad7192_state *st,
 
 	if (pdata->chop_en) {
 		st->conf |= AD7192_CONF_CHOP;
-		if (pdata->sinc3_en)
+		if (sinc3_en)
 			st->f_order = 3; /* SINC 3rd order */
 		else
 			st->f_order = 4; /* SINC 4th order */
@@ -499,7 +511,7 @@ static int ad7192_read_raw(struct iio_dev *indio_dev,
 			*val -= 273 * ad7192_get_temp_scale(unipolar);
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		*val = st->mclk /
+		*val = st->fclk /
 			(st->f_order * 1024 * AD7192_MODE_RATE(st->mode));
 		return IIO_VAL_INT;
 	}
@@ -546,7 +558,7 @@ static int ad7192_write_raw(struct iio_dev *indio_dev,
 			break;
 		}
 
-		div = st->mclk / (val * st->f_order * 1024);
+		div = st->fclk / (val * st->f_order * 1024);
 		if (div < 1 || div > 1023) {
 			ret = -EINVAL;
 			break;
